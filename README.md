@@ -114,6 +114,14 @@
 
 ---
 
+## 🔄 Fork 自动同步上游
+
+仓库中的 `.github/workflows/sync.yml` 会每天从 `cmliu/edgetunnel` 的 `main` 分支同步一次，也可以在 GitHub 的 Actions 页面手动运行 `Sync upstream`。
+
+首次使用 Fork 时，需要在 GitHub 仓库中打开 `Actions` 并启用工作流，然后在 `Settings` → `Actions` → `General` 中允许工作流运行，并将 `Workflow permissions` 设置为允许读写仓库内容。同步工作流需要写权限才能把合并结果推回当前 Fork。
+
+如果上游更新与本 Fork 的修改发生冲突，工作流会停止，需手动解决冲突后再运行一次。
+
 ## 🔑 环境变量说明
 
 | 变量名 | 必填 | 示例 | 详细备注 |
