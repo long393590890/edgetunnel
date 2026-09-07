@@ -7,6 +7,9 @@ const WS早期数据最大字节 = 8 * 1024, WS早期数据最大头长度 = Mat
 const 上行合包目标字节 = 20 * 1024, 上行队列最大字节 = 16 * 1024 * 1024, 上行队列最大条目 = 4096;
 const 下行Grain包字节 = 32 * 1024, 下行Grain尾部阈值 = 512, 下行Grain低水位字节 = Math.max(4096, 下行Grain尾部阈值 * 12), 下行Grain最大等待轮次 = 4;
 let TCP并发拨号数 = 2, 反代并发拨号数 = 1, 预加载竞速拨号 = false;
+const 订阅Token默认超时分钟 = 30 * 24 * 60;
+const 订阅Token存储键 = 'subtokens.json';
+const 订阅Token设置存储键 = 'subtoken_settings.json';
 ///////////////////////////////////////////////////////查杀特征码///////////////////////////////////////////////
 const 特征码字典 = [
 	(Proxy.name + "IP").toUpperCase(),
@@ -65,19 +68,26 @@ export default {
 				if (请求前8总和 === 目标前8总和 && 请求UUID.slice(-12) === 目标UUID.slice(-12)) return new Response(JSON.stringify({ Version: Number(String(Version).replace(/\D+/g, '')) }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 			}
 		} else if (管理员密码 && upgradeHeader === 'websocket') {// WebSocket代理
+			const 节点授权 = await 验证节点授权(env, host, userID, url.searchParams.get('token'), await MD5MD5(host + userID), 订阅Token默认超时分钟);
+			if (!节点授权.valid) return new Response(节点授权.reason === 'expired' ? '节点 token 已过期或已禁用' : '节点 token 无效', { status: 节点授权.reason === 'expired' ? 410 : 403, headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' } });
+			const 节点UUID = 节点授权.nodeUUID || userID;
 			const 反代上下文 = await 反代参数获取(url, userID, 默认反代IP, 默认反代兜底);
 			log(`[WebSocket] 命中请求: ${url.pathname}${url.search}`);
-			return await 处理WS请求(request, userID, url, 反代上下文);
+			return await 处理WS请求(request, 节点UUID, url, 反代上下文);
 		} else if (管理员密码 && !访问路径.startsWith('admin/') && 访问路径 !== 'login' && request.method === 'POST') {// gRPC/叉HTTP代理
+			const 请求节点Token = url.searchParams.get('token') || (contentType.startsWith('application/grpc') ? 从gRPC路径读取订阅Token(url.pathname) : null);
+			const 节点授权 = await 验证节点授权(env, host, userID, 请求节点Token, await MD5MD5(host + userID), 订阅Token默认超时分钟);
+			if (!节点授权.valid) return new Response(节点授权.reason === 'expired' ? '节点 token 已过期或已禁用' : '节点 token 无效', { status: 节点授权.reason === 'expired' ? 410 : 403, headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' } });
+			const 节点UUID = 节点授权.nodeUUID || userID;
 			const 反代上下文 = await 反代参数获取(url, userID, 默认反代IP, 默认反代兜底);
-			const { 头: 本机Padding头, 键: 本机Padding键 } = 获取叉HTTPPadding标识(userID);
+			const { 头: 本机Padding头, 键: 本机Padding键 } = 获取叉HTTPPadding标识(节点UUID);
 			const 命中叉HTTP特征 = !!request.headers.get(本机Padding头) || !!url.searchParams.get(本机Padding键);
 			if (!命中叉HTTP特征 && contentType.startsWith('application/grpc')) {
 				log(`[gRPC] 命中请求: ${url.pathname}${url.search}`);
-				return await 处理gRPC请求(request, userID, 反代上下文);
+				return await 处理gRPC请求(request, 节点UUID, 反代上下文);
 			}
 			log(`[叉HTTP] 命中请求: ${url.pathname}${url.search}`);
-			return await 处理叉HTTP请求(request, userID, 反代上下文);
+			return await 处理叉HTTP请求(request, 节点UUID, 反代上下文);
 		} else {
 			if (url.protocol === 'http:') return Response.redirect(url.href.replace(`http://${url.hostname}`, `https://${url.hostname}`), 301);
 			if (!管理员密码) return fetch(Pages静态页面 + '/noADMIN').then(r => { const headers = new Headers(r.headers); headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate'); headers.set('Pragma', 'no-cache'); headers.set('Expires', '0'); return new Response(r.body, { status: 404, statusText: r.statusText, headers }) });
@@ -206,7 +216,36 @@ export default {
 
 					config_JSON = await 读取config_JSON(env, host, userID, UA);
 
-					if (访问路径 === 'admin/init') {// 重置配置为默认值
+					if (访问路径 === 'admin/tokens' && request.method === 'GET') {
+						return new Response(生成订阅Token管理页面(), { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
+					} else if (访问路径 === 'admin/tokens.json' && request.method === 'GET') {
+						const tokenData = await 获取订阅Token管理数据(env, host, userID, config_JSON.订阅Token超时分钟, url.origin);
+						return new Response(JSON.stringify(tokenData, null, 2), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8', 'Cache-Control': 'no-store' } });
+					} else if (访问路径 === 'admin/tokens.json' && request.method === 'POST') {
+						try {
+							const body = await request.json();
+							const action = String(body?.action || '').toLowerCase();
+							if (action === 'settings') {
+								const timeoutMinutes = 规范化订阅Token超时分钟(body.timeoutMinutes, config_JSON.订阅Token超时分钟);
+								await 保存订阅Token设置(env, timeoutMinutes);
+								config_JSON.订阅Token超时分钟 = timeoutMinutes;
+								return new Response(JSON.stringify({ success: true, defaultTimeoutMinutes: timeoutMinutes }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
+							}
+							if (action === 'create') {
+								const tokenData = await 创建订阅Token(env, host, userID, body.name, body.timeoutMinutes, config_JSON.订阅Token超时分钟, url.origin);
+								ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Create_Subscription_Token', config_JSON));
+								return new Response(JSON.stringify({ success: true, ...tokenData }), { status: 201, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
+							}
+							if (action === 'update') {
+								const tokenData = await 更新订阅Token(env, host, userID, body.token, body.timeoutMinutes, url.origin);
+								ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Update_Subscription_Token', config_JSON));
+								return new Response(JSON.stringify({ success: true, ...tokenData }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
+							}
+							return new Response(JSON.stringify({ error: '不支持的 token 操作' }), { status: 400, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
+						} catch (error) {
+							return new Response(JSON.stringify({ error: error.message || 'token 操作失败' }), { status: 400, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
+						}
+					} else if (访问路径 === 'admin/init') {// 重置配置为默认值
 						try {
 							config_JSON = await 读取config_JSON(env, host, userID, UA, true);
 							ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Init_Config', config_JSON));
@@ -301,18 +340,25 @@ export default {
 					响应.headers.set('Set-Cookie', 'auth=; Path=/; Max-Age=0; HttpOnly');
 					return 响应;
 				} else if (访问路径 === 'sub') {//处理订阅请求
-					const 订阅TOKEN = await MD5MD5(host + userID), 作为优选订阅生成器 = ['1', 'true'].includes(env.BEST_SUB) && url.searchParams.get('host') === 'example.com' && url.searchParams.get('uuid') === '00000000-0000-4000-8000-000000000000' && UA.toLowerCase().includes('tunnel (https://github.com/' + 特征码字典[1] + '/edge');
 					const 请求TOKEN = url.searchParams.get('token');
-					const 用户客户端请求订阅 = 请求TOKEN === 订阅TOKEN;
+					const 订阅TOKEN = await MD5MD5(host + userID), 作为优选订阅生成器 = ['1', 'true'].includes(env.BEST_SUB) && url.searchParams.get('host') === 'example.com' && url.searchParams.get('uuid') === '00000000-0000-4000-8000-000000000000' && UA.toLowerCase().includes('tunnel (https://github.com/' + 特征码字典[1] + '/edge');
+					const tokenValidation = await 验证订阅Token(env, host, userID, 请求TOKEN, 订阅TOKEN, 订阅Token默认超时分钟);
+					if (!作为优选订阅生成器 && tokenValidation.reason === 'expired') return new Response('订阅 token 已过期或已禁用', { status: 410, headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' } });
+					const 用户客户端请求订阅 = tokenValidation.valid && tokenValidation.kind === 'direct';
 					const 当前日序号 = Math.floor(Date.now() / 86400000);
-					const 订阅转换后端TOKEN种子 = base64SecretEncode(订阅TOKEN, userID);
+					const 生效订阅TOKEN = tokenValidation.token || 订阅TOKEN;
+					const 订阅转换后端TOKEN种子 = base64SecretEncode(生效订阅TOKEN, userID);
 					const [今日订阅转换后端专属TOKEN, 昨日订阅转换后端专属TOKEN] = await Promise.all([
 						MD5MD5(订阅转换后端TOKEN种子 + 当前日序号),
 						MD5MD5(订阅转换后端TOKEN种子 + (当前日序号 - 1)),
 					]);
-					const 订阅转换后端请求订阅 = 请求TOKEN === 今日订阅转换后端专属TOKEN || 请求TOKEN === 昨日订阅转换后端专属TOKEN;
+					const 订阅转换后端请求订阅 = tokenValidation.valid && tokenValidation.kind === 'converter';
 					if (用户客户端请求订阅 || 订阅转换后端请求订阅 || 作为优选订阅生成器) {
 						config_JSON = await 读取config_JSON(env, host, userID, UA);
+						if (tokenValidation.valid && tokenValidation.record) {
+							config_JSON.UUID = tokenValidation.record.nodeUUID || tokenValidation.record.userID || userID;
+							config_JSON.完整节点路径 = 追加订阅Token节点路径(config_JSON.完整节点路径, 生效订阅TOKEN);
+						}
 						if (作为优选订阅生成器) ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Get_Best_SUB', config_JSON, false));
 						else ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Get_SUB', config_JSON));
 						const ua = UA.toLowerCase();
@@ -437,6 +483,7 @@ export default {
 									const 匹配到的反代IP = 反代IP池.find(p => p.includes(节点地址));
 									if (匹配到的反代IP) 完整节点路径 = (`${config_JSON.PATH}/proxyip=${匹配到的反代IP}`).replace(/\/\//g, '/') + (config_JSON.启用0RTT ? '?ed=2560' : '');
 								}
+								if (tokenValidation.valid && tokenValidation.record) 完整节点路径 = 追加订阅Token节点路径(完整节点路径, 生效订阅TOKEN);
 								if (isLoonOrSurge) 完整节点路径 = 完整节点路径.replace(/,/g, '%2C');
 
 								if (协议类型 === 'ss' && !作为优选订阅生成器) {
@@ -459,7 +506,7 @@ export default {
 								const response = await fetch(订阅转换URL, { headers: { 'User-Agent': 'Subconverter for ' + 订阅类型 + ' edge' + 'tunnel (https://github.com/' + 特征码字典[1] + '/edge' + 'tunnel)' } });
 								if (response.ok) {
 									订阅内容 = await response.text();
-									if (url.searchParams.has('surge') || ua.includes('surge')) 订阅内容 = Surge订阅配置文件热补丁(订阅内容, url.protocol + '//' + url.host + '/sub?token=' + 订阅TOKEN + '&surge', config_JSON);
+									if (url.searchParams.has('surge') || ua.includes('surge')) 订阅内容 = Surge订阅配置文件热补丁(订阅内容, url.protocol + '//' + url.host + '/sub?token=' + encodeURIComponent(生效订阅TOKEN) + '&surge', config_JSON);
 								} else return new Response('订阅转换后端异常：' + response.statusText, { status: response.status });
 							} catch (error) {
 								return new Response('订阅转换后端异常：' + error.message, { status: 403 });
@@ -4810,7 +4857,11 @@ function 获取传输协议配置(配置 = {}) {
 function 获取传输路径参数值(配置 = {}, 节点路径 = '/', 作为优选订阅生成器 = false) {
 	const 路径值 = 作为优选订阅生成器 ? '/' : (配置.随机路径 ? 随机路径(节点路径) : 节点路径);
 	if (配置.传输协议 !== 'grpc') return 路径值;
-	return 路径值.split('?')[0] || '/';
+	const queryIndex = 路径值.indexOf('?');
+	if (queryIndex < 0) return 路径值 || '/';
+	const path = 路径值.slice(0, queryIndex).replace(/\/$/, '') || '';
+	const token = new URLSearchParams(路径值.slice(queryIndex + 1)).get('token');
+	return token ? `${path}/.token=${encodeURIComponent(token)}` : (path || '/');
 }
 
 function log(...args) {
@@ -5413,6 +5464,241 @@ async function MD5MD5(文本) {
 	return 第二次十六进制.toLowerCase();
 }
 
+function 规范化订阅Token超时分钟(值, 默认值 = 订阅Token默认超时分钟) {
+	const 原始值 = 值 === undefined || 值 === null || 值 === '' ? 默认值 : Number(值);
+	if (!Number.isFinite(原始值) || 原始值 < 0 || 原始值 > 52560000) throw new Error('超时时间必须是 0 到 52560000 之间的分钟数');
+	return Math.floor(原始值);
+}
+
+function 生成随机订阅Token() {
+	const bytes = new Uint8Array(24);
+	crypto.getRandomValues(bytes);
+	return Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function 新建订阅Token记录(token, host, userID, name, timeoutMinutes, now = Date.now(), legacy = false) {
+	const timeout = 规范化订阅Token超时分钟(timeoutMinutes);
+	return {
+		id: crypto.randomUUID(),
+		token,
+		name: String(name || (legacy ? '默认订阅 token' : '未命名 token')).trim().slice(0, 80) || (legacy ? '默认订阅 token' : '未命名 token'),
+		host,
+		userID,
+		nodeUUID: legacy ? userID : crypto.randomUUID(),
+		createdAt: now,
+		updatedAt: now,
+		expiresAt: timeout === 0 ? 0 : now + timeout * 60 * 1000,
+		legacy,
+	};
+}
+
+async function 读取订阅Token存储(env) {
+	try {
+		const raw = await env.KV.get(订阅Token存储键);
+		if (!raw) return { version: 1, tokens: [] };
+		const parsed = JSON.parse(raw);
+		if (Array.isArray(parsed)) {
+			for (const record of parsed) {
+				if (record && !record.nodeUUID) record.nodeUUID = record.userID;
+			}
+			return { version: 1, tokens: parsed };
+		}
+		if (!parsed || !Array.isArray(parsed.tokens)) return { version: 1, tokens: [] };
+		for (const record of parsed.tokens) {
+			if (record && !record.nodeUUID) record.nodeUUID = record.userID;
+		}
+		return { version: 1, tokens: parsed.tokens };
+	} catch (error) {
+		console.error(`读取${订阅Token存储键}失败: ${error.message}`);
+		return { version: 1, tokens: [] };
+	}
+}
+
+async function 保存订阅Token存储(env, store) {
+	await env.KV.put(订阅Token存储键, JSON.stringify({ version: 1, tokens: store.tokens }, null, 2));
+}
+
+async function 读取订阅Token设置(env, fallback = 订阅Token默认超时分钟) {
+	try {
+		const raw = await env.KV.get(订阅Token设置存储键);
+		if (!raw) return { defaultTimeoutMinutes: 规范化订阅Token超时分钟(fallback) };
+		const parsed = JSON.parse(raw);
+		return { defaultTimeoutMinutes: 规范化订阅Token超时分钟(parsed.defaultTimeoutMinutes, fallback) };
+	} catch (error) {
+		console.error(`读取${订阅Token设置存储键}失败: ${error.message}`);
+		return { defaultTimeoutMinutes: 规范化订阅Token超时分钟(fallback) };
+	}
+}
+
+async function 保存订阅Token设置(env, timeoutMinutes) {
+	await env.KV.put(订阅Token设置存储键, JSON.stringify({ version: 1, defaultTimeoutMinutes: 规范化订阅Token超时分钟(timeoutMinutes) }, null, 2));
+}
+
+async function 确保默认订阅Token记录(env, host, userID, timeoutMinutes) {
+	const 默认Token = await MD5MD5(host + userID);
+	const store = await 读取订阅Token存储(env);
+	let record = store.tokens.find(item => item && item.token === 默认Token && item.host === host && item.userID === userID);
+	if (!record) {
+		record = 新建订阅Token记录(默认Token, host, userID, '默认订阅 token', timeoutMinutes, Date.now(), true);
+		store.tokens.push(record);
+		await 保存订阅Token存储(env, store);
+	}
+	return { store, record };
+}
+
+function 订阅Token记录状态(record, now = Date.now()) {
+	if (!record || Number(record.expiresAt) === 0) return { status: 'disabled', remainingMinutes: 0 };
+	if (!Number.isFinite(Number(record.expiresAt)) || Number(record.expiresAt) <= now) return { status: 'expired', remainingMinutes: 0 };
+	return { status: 'active', remainingMinutes: Math.ceil((Number(record.expiresAt) - now) / 60000) };
+}
+
+function 序列化订阅Token记录(record, origin, now = Date.now()) {
+	const state = 订阅Token记录状态(record, now);
+	return {
+		id: record.id,
+		name: record.name,
+		token: record.token,
+		url: `${origin}/sub?token=${encodeURIComponent(record.token)}`,
+		createdAt: record.createdAt,
+		updatedAt: record.updatedAt,
+		expiresAt: record.expiresAt,
+		status: state.status,
+		remainingMinutes: state.remainingMinutes,
+		legacy: Boolean(record.legacy),
+	};
+}
+
+function 追加订阅Token节点路径(path, token) {
+	const rawPath = String(path || '/');
+	const tokenParam = `token=${encodeURIComponent(token)}`;
+	const queryIndex = rawPath.indexOf('?');
+	if (queryIndex >= 0 && new URLSearchParams(rawPath.slice(queryIndex + 1)).has('token')) return rawPath;
+	return rawPath.includes('?') ? `${rawPath}&${tokenParam}` : `${rawPath}?${tokenParam}`;
+}
+
+function 从gRPC路径读取订阅Token(pathname) {
+	const match = String(pathname || '').match(/(?:^|\/)\.token=([^/]+)$/i);
+	if (!match) return null;
+	try { return decodeURIComponent(match[1]); } catch (error) { return null; }
+}
+
+async function 获取订阅Token管理数据(env, host, userID, fallbackMinutes, origin = '') {
+	const settings = await 读取订阅Token设置(env, fallbackMinutes);
+	const { store } = await 确保默认订阅Token记录(env, host, userID, settings.defaultTimeoutMinutes);
+	return {
+		defaultTimeoutMinutes: settings.defaultTimeoutMinutes,
+		tokens: store.tokens
+			.filter(record => record && record.host === host && record.userID === userID)
+			.map(record => 序列化订阅Token记录(record, origin, Date.now())),
+	};
+}
+
+async function 创建订阅Token(env, host, userID, name, timeoutMinutes, fallbackMinutes, origin = '') {
+	const settings = await 读取订阅Token设置(env, fallbackMinutes);
+	const timeout = 规范化订阅Token超时分钟(timeoutMinutes, settings.defaultTimeoutMinutes);
+	const store = await 读取订阅Token存储(env);
+	let token;
+	 do {
+		token = 生成随机订阅Token();
+	} while (store.tokens.some(record => record?.token === token));
+	const record = 新建订阅Token记录(token, host, userID, name, timeout);
+	store.tokens.push(record);
+	await 保存订阅Token存储(env, store);
+	return 序列化订阅Token记录(record, origin);
+}
+
+async function 更新订阅Token(env, host, userID, token, timeoutMinutes, origin = '') {
+	if (typeof token !== 'string' || !token.trim()) throw new Error('缺少 token');
+	const store = await 读取订阅Token存储(env);
+	const record = store.tokens.find(item => item && item.token === token.trim() && item.host === host && item.userID === userID);
+	if (!record) throw new Error('token 不存在');
+	const timeout = 规范化订阅Token超时分钟(timeoutMinutes, 0);
+	const now = Date.now();
+	record.updatedAt = now;
+	record.expiresAt = timeout === 0 ? 0 : now + timeout * 60 * 1000;
+	await 保存订阅Token存储(env, store);
+	return 序列化订阅Token记录(record, origin);
+}
+
+async function 验证订阅Token(env, host, userID, requestToken, legacyToken, fallbackMinutes) {
+	if (typeof requestToken !== 'string' || !requestToken) return { valid: false, reason: 'missing' };
+	const settings = await 读取订阅Token设置(env, fallbackMinutes);
+	let store = await 读取订阅Token存储(env);
+	let record = store.tokens.find(item => item && item.token === requestToken && item.host === host && item.userID === userID);
+	if (!record && requestToken === legacyToken) {
+		const ensured = await 确保默认订阅Token记录(env, host, userID, settings.defaultTimeoutMinutes);
+		store = ensured.store;
+		record = ensured.record;
+	}
+	if (record) {
+		const state = 订阅Token记录状态(record);
+		return state.status === 'active' ? { valid: true, kind: 'direct', token: record.token, record } : { valid: false, reason: 'expired', record };
+	}
+
+	const 当前日序号 = Math.floor(Date.now() / 86400000);
+	const candidates = store.tokens.filter(item => item && item.host === host && item.userID === userID);
+	const converterMatches = await Promise.all(candidates.map(async item => {
+		const seed = base64SecretEncode(item.token, userID);
+		const [today, yesterday] = await Promise.all([
+			MD5MD5(seed + 当前日序号),
+			MD5MD5(seed + (当前日序号 - 1)),
+		]);
+		return today === requestToken || yesterday === requestToken ? item : null;
+	}));
+	const converterRecord = converterMatches.find(Boolean);
+	if (!converterRecord) return { valid: false, reason: 'invalid' };
+	const state = 订阅Token记录状态(converterRecord);
+	return state.status === 'active' ? { valid: true, kind: 'converter', token: converterRecord.token, record: converterRecord } : { valid: false, reason: 'expired', record: converterRecord };
+}
+
+async function 验证节点授权(env, host, userID, requestToken, legacyToken, fallbackMinutes) {
+	if (requestToken) {
+		const result = await 验证订阅Token(env, host, userID, requestToken, legacyToken, fallbackMinutes);
+		if (!result.valid || result.kind !== 'direct') return { valid: false, reason: result.reason || 'invalid' };
+		return { valid: true, nodeUUID: result.record?.nodeUUID || result.record?.userID || userID, record: result.record };
+	}
+
+	const settings = await 读取订阅Token设置(env, fallbackMinutes);
+	const { record } = await 确保默认订阅Token记录(env, host, userID, settings.defaultTimeoutMinutes);
+	const state = 订阅Token记录状态(record);
+	return state.status === 'active'
+		? { valid: true, nodeUUID: record.nodeUUID || userID, record }
+		: { valid: false, reason: 'expired', record };
+}
+
+function 生成订阅Token管理页面() {
+	return `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Token 管理</title>
+<style>
+:root{color-scheme:light; font-family:system-ui,-apple-system,"Segoe UI",sans-serif}*{box-sizing:border-box}body{margin:0;background:#f4f6f8;color:#17202a}main{max-width:1180px;margin:32px auto;padding:0 20px}h1{font-size:26px;margin:0 0 22px}.panel{background:#fff;border:1px solid #dfe4ea;border-radius:8px;padding:20px;margin-bottom:18px;box-shadow:0 2px 8px #17202a0d}.row{display:flex;gap:12px;align-items:end;flex-wrap:wrap}.field{display:flex;flex-direction:column;gap:6px;min-width:180px}label{font-size:13px;color:#52606d}input{height:36px;border:1px solid #c8d0d9;border-radius:5px;padding:0 10px;font-size:14px}button{height:36px;border:0;border-radius:5px;background:#1769e0;color:#fff;padding:0 14px;cursor:pointer}button.secondary{background:#e9eef5;color:#1f2933}button.danger{background:#c53030}button:disabled{opacity:.6;cursor:wait}.hint{color:#697586;font-size:13px;margin-top:10px}#message{min-height:22px;margin:8px 0;color:#1769e0}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;min-width:920px}th,td{border-bottom:1px solid #edf0f3;text-align:left;padding:11px 8px;font-size:13px;vertical-align:middle}th{color:#52606d;background:#f8fafc;font-weight:600}code{word-break:break-all;color:#364152}.status-active{color:#087443}.status-expired,.status-disabled{color:#c53030}.actions{display:flex;gap:6px;align-items:center}.actions input{width:110px}.small{font-size:12px;color:#697586}.empty{text-align:center;color:#697586;padding:24px}
+</style>
+</head>
+<body><main>
+<h1>订阅 Token 管理</h1>
+<div id="message"></div>
+<section class="panel"><h2>默认超时时间</h2><div class="row"><div class="field"><label for="defaultMinutes">分钟</label><input id="defaultMinutes" type="number" min="0" step="1"></div><button id="saveDefault">保存默认值</button></div><div class="hint">新创建的 token 使用此值；0 表示创建后立即禁用。默认值为 43200 分钟（30 天）。</div></section>
+<section class="panel"><h2>创建 Token</h2><div class="row"><div class="field"><label for="tokenName">名称</label><input id="tokenName" maxlength="80" placeholder="例如：手机"></div><div class="field"><label for="createMinutes">超时时间（分钟）</label><input id="createMinutes" type="number" min="0" step="1"></div><button id="createToken">创建 Token</button></div></section>
+<section class="panel"><h2>已有 Token</h2><div class="table-wrap"><table><thead><tr><th>名称</th><th>Token / 订阅链接</th><th>状态</th><th>到期时间</th><th>剩余</th><th>修改时长（分钟）</th><th>操作</th></tr></thead><tbody id="tokenRows"><tr><td class="empty" colspan="7">加载中...</td></tr></tbody></table></div></section>
+</main>
+<script>
+const api='/admin/tokens.json';
+const $=id=>document.getElementById(id);
+const message=text=>{$('message').textContent=text||''};
+const formatTime=value=>value?new Date(value).toLocaleString():'未设置';
+async function call(body){const response=await fetch(api,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const data=await response.json().catch(()=>({error:'响应格式错误'}));if(!response.ok)throw new Error(data.error||'请求失败');return data}
+function addCell(row,value,html){const cell=document.createElement('td');if(html)cell.innerHTML=html;else cell.textContent=value;row.appendChild(cell);return cell}
+function render(data){$('defaultMinutes').value=data.defaultTimeoutMinutes;$('createMinutes').value=data.defaultTimeoutMinutes;const rows=$('tokenRows');rows.textContent='';if(!data.tokens.length){rows.innerHTML='<tr><td class="empty" colspan="7">暂无 Token</td></tr>';return}data.tokens.forEach(item=>{const row=document.createElement('tr');addCell(row,item.name);addCell(row,'',true).innerHTML='<code>'+item.token+'<br>'+item.url+'</code>';const status=addCell(row,item.status==='active'?'有效':item.status==='disabled'?'已禁用':'已过期');status.className='status-'+item.status;addCell(row,formatTime(item.expiresAt));addCell(row,item.status==='active'?item.remainingMinutes+' 分钟':'0 分钟');const actionCell=addCell(row,'');actionCell.className='actions';const input=document.createElement('input');input.type='number';input.min='0';input.step='1';input.value=item.status==='active'?item.remainingMinutes:0;actionCell.appendChild(input);const save=document.createElement('button');save.textContent='保存';save.onclick=async()=>{try{save.disabled=true;await call({action:'update',token:item.token,timeoutMinutes:input.value});message('Token 已更新');await load()}catch(error){message(error.message)}finally{save.disabled=false}};const disable=document.createElement('button');disable.textContent='禁用';disable.className='danger';disable.onclick=async()=>{try{disable.disabled=true;await call({action:'update',token:item.token,timeoutMinutes:0});message('Token 已禁用');await load()}catch(error){message(error.message)}finally{disable.disabled=false}};actionCell.append(save,disable);const copyCell=addCell(row,'');const copy=document.createElement('button');copy.textContent='复制链接';copy.className='secondary';copy.onclick=()=>navigator.clipboard.writeText(item.url).then(()=>message('订阅链接已复制'));copyCell.appendChild(copy);rows.appendChild(row)})}
+async function load(){try{const response=await fetch(api,{cache:'no-store'});const data=await response.json();if(!response.ok)throw new Error(data.error||'加载失败');render(data)}catch(error){message(error.message)}}
+$('saveDefault').onclick=async()=>{try{$('saveDefault').disabled=true;await call({action:'settings',timeoutMinutes:$('defaultMinutes').value});message('默认超时时间已保存');await load()}catch(error){message(error.message)}finally{$('saveDefault').disabled=false}};
+$('createToken').onclick=async()=>{try{$('createToken').disabled=true;const data=await call({action:'create',name:$('tokenName').value,timeoutMinutes:$('createMinutes').value});message('Token 创建成功：'+data.url);$('tokenName').value='';await load()}catch(error){message(error.message)}finally{$('createToken').disabled=false}};
+load();
+</script></body></html>`;
+}
+
 function 随机路径(完整节点路径 = "/") {
 	const 常用路径目录 = ["about", "account", "acg", "act", "activity", "ad", "ads", "ajax", "album", "albums", "anime", "api", "app", "apps", "archive", "archives", "article", "articles", "ask", "auth", "avatar", "bbs", "bd", "blog", "blogs", "book", "books", "bt", "buy", "cart", "category", "categories", "cb", "channel", "channels", "chat", "china", "city", "class", "classify", "clip", "clips", "club", "cn", "code", "collect", "collection", "comic", "comics", "community", "company", "config", "contact", "content", "course", "courses", "cp", "data", "detail", "details", "dh", "directory", "discount", "discuss", "dl", "dload", "doc", "docs", "document", "documents", "doujin", "download", "downloads", "drama", "edu", "en", "ep", "episode", "episodes", "event", "events", "f", "faq", "favorite", "favourites", "favs", "feedback", "file", "files", "film", "films", "forum", "forums", "friend", "friends", "game", "games", "gif", "go", "go.html", "go.php", "group", "groups", "help", "home", "hot", "htm", "html", "image", "images", "img", "index", "info", "intro", "item", "items", "ja", "jp", "jump", "jump.html", "jump.php", "jumping", "knowledge", "lang", "lesson", "lessons", "lib", "library", "link", "links", "list", "live", "lives", "m", "mag", "magnet", "mall", "manhua", "map", "member", "members", "message", "messages", "mobile", "movie", "movies", "music", "my", "new", "news", "note", "novel", "novels", "online", "order", "out", "out.html", "out.php", "outbound", "p", "page", "pages", "pay", "payment", "pdf", "photo", "photos", "pic", "pics", "picture", "pictures", "play", "player", "playlist", "post", "posts", "product", "products", "program", "programs", "project", "qa", "question", "rank", "ranking", "read", "readme", "redirect", "redirect.html", "redirect.php", "reg", "register", "res", "resource", "retrieve", "sale", "search", "season", "seasons", "section", "seller", "series", "service", "services", "setting", "settings", "share", "shop", "show", "shows", "site", "soft", "sort", "source", "special", "star", "stars", "static", "stock", "store", "stream", "streaming", "streams", "student", "study", "tag", "tags", "task", "teacher", "team", "tech", "temp", "test", "thread", "tool", "tools", "topic", "topics", "torrent", "trade", "travel", "tv", "txt", "type", "u", "upload", "uploads", "url", "urls", "user", "users", "v", "version", "videos", "view", "vip", "vod", "watch", "web", "wenku", "wiki", "work", "www", "zh", "zh-cn", "zh-tw", "zip"];
 	const 随机数 = Math.floor(Math.random() * 3 + 1);
@@ -5603,6 +5889,7 @@ async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0", 重�
 		UUID: userID,
 		PATH: "/",
 		ALPN: "",
+		订阅Token超时分钟: 订阅Token默认超时分钟,
 		协议类型: "v" + "le" + "ss",
 		传输协议: "ws",
 		gRPC模式: "gun",
@@ -5721,6 +6008,8 @@ async function 读取config_JSON(env, hostname, userID, UA = "Mozilla/5.0", 重�
 	if (!config_JSON.HOSTS) config_JSON.HOSTS = [hostname];
 	if (env.HOST) config_JSON.HOSTS = (await 整理成数组(env.HOST)).map(h => h.toLowerCase().replace(/^https?:\/\//, '').split('/')[0].split(':')[0]);
 	config_JSON.UUID = userID;
+	const tokenSettings = await 读取订阅Token设置(env, config_JSON.订阅Token超时分钟 ?? 订阅Token默认超时分钟);
+	config_JSON.订阅Token超时分钟 = tokenSettings.defaultTimeoutMinutes;
 	if (!config_JSON.随机路径) config_JSON.随机路径 = false;
 	if (!config_JSON.启用0RTT) config_JSON.启用0RTT = false;
 
